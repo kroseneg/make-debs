@@ -1,0 +1,234 @@
+#!/bin/bash
+
+DEBDIR=$(dirname $0)/deb
+
+DEBIAN_ARCH="$(dpkg --print-architecture)"
+
+URL_BASE="https://rhlx01.hs-esslingen.de/pub/Mirrors/eclipse/technology/epp/downloads/release/"
+URL_RELEASE="${URL_BASE}release.xml"
+XML_RELEASE="$(wget -q -O - "${URL_RELEASE}")"
+RELEASE="$(echo "${XML_RELEASE}" | grep present | sed 's/^\s*[^>]*>\([^<]*\)<.*$/\1/')"
+RELEASEVER="$(echo "${RELEASE}" | sed 's/[^0-9a-zA-Z]/-/g')"
+PACKAGE_VERSION="$(echo "${RELEASEVER}" | sed 's/-/./g')-1"
+URL_BASE_DOWNLOAD="${URL_BASE}${RELEASE}/"
+
+
+#echo "RELEASE   =${RELEASE}"
+#echo "RELEASEVER=${RELEASEVER}"
+
+
+DEBDIR=$(readlink -f $DEBDIR)
+
+debian_arch_to_eclipse_arch() {
+	DEBIAN_ARCH="$1"
+	case "$DEBIAN_ARCH" in
+		amd64)
+			ECLIPSE_ARCH="x86_64"
+			;;
+		arm64)
+			ECLIPSE_ARCH="aarch64"
+			;;
+#		i386)
+#			ECLIPSE_ARCH="x86"
+#			;;
+		*)
+			echo "The architecture $DEBIAN_ARCH is not supported." >&2
+			exit 1
+			;;
+	esac
+	echo "${ECLIPSE_ARCH}"
+}
+
+eclipse_arch_to_debian_arch() {
+	ECLIPSE_ARCH="$1"
+	case "$ECLIPSE_ARCH" in
+		x86_64)
+			DEBIAN_ARCH="amd64"
+			;;
+		aarch64)
+			DEBIAN_ARCH="arm64"
+			;;
+#		x86)
+#			ECLIPSE_ARCH="i386"
+#			;;
+		*)
+			echo "The architecture $ECLIPSE_ARCH is not supported." >&2
+			exit 1
+			;;
+	esac
+	echo "${DEBIAN_ARCH}"
+}
+
+make_deb() {
+	PACKAGE_FLAVOR="$1"
+	DEBIAN_ARCH="$2"
+	ECLIPSE_ARCH="$(debian_arch_to_eclipse_arch "$DEBIAN_ARCH")"
+	
+	PACKAGE="eclipse-${PACKAGE_FLAVOR}"
+
+	URL_FLAVOR="${URL_BASE_DOWNLOAD}${PACKAGE_FLAVOR}.xml"
+
+	XML_FLAVOR="$(wget -q -O - "${URL_FLAVOR}")"
+
+	PACKAGE_DESCRIPTION="$( echo "${XML_FLAVOR}" | grep 'packageName=' | sed 's/^\s*packageName="//;s/"\s*//' )"
+	PACKAGE_ICONURL="$( echo "${XML_FLAVOR}" | grep 'iconurl=' | sed 's/^\s*iconurl="//;s/"\s*//' )"
+
+	PACKAGE_DESCRIPTION_LONG="$( echo "${XML_FLAVOR}" | xmlstarlet sel -T -t -c '//packageMetaData/.' | xargs | sed 's|<.*||m' | fold -w 76 -s | sed 's|^| |' )"
+
+	URL_TARGZ="${URL_BASE_DOWNLOAD}${PACKAGE}-${RELEASEVER}-linux-gtk-${ECLIPSE_ARCH}.tar.gz"
+	FILE_TARGZ="tmp/$(basename "${URL_TARGZ}")"
+
+	DEB_FILE="${DEBDIR}/${DEBIAN_ARCH}/${PACKAGE}_${PACKAGE_VERSION}_${DEBIAN_ARCH}.deb"
+	DESTDIR="tmp/$(basename "${DEB_FILE}" .deb)"
+
+	if [ -e "${DEB_FILE}" ]; then
+		echo "${DEB_FILE} exists, not building."
+		return 1
+	fi
+
+	echo "Building ${DEB_FILE}..."
+
+	for ext in "" .md5 .sha1 .sha512; do
+		wget -q --show-progress -c "${URL_TARGZ}${ext}" -O "${FILE_TARGZ}${ext}"
+	done
+
+	INSTALL_DIR="${DESTDIR}/opt/"
+	mkdir -p "${INSTALL_DIR}"
+	mkdir -p "${DESTDIR}/DEBIAN/"
+	mkdir -p "${DESTDIR}/usr/share/applications/"
+
+	echo "Extracting ${FILE_TARGZ}..."
+	tar --directory="${INSTALL_DIR}" -xzf "${FILE_TARGZ}"
+	mv "${INSTALL_DIR}/eclipse" "${INSTALL_DIR}/eclipse-${PACKAGE_FLAVOR}"
+
+	FILENAME_ICON="icon.xpm"
+	if [ ! -z "${PACKAGE_ICONURL}" ]; then
+		FILENAME_ICON=eclipse-${PACKAGE_FLAVOR}.$( echo "${PACKAGE_ICONURL}" | sed 's/?.*//; s/.*\.//' )
+		wget -q "${PACKAGE_ICONURL}" -O "${INSTALL_DIR}/eclipse-${PACKAGE_FLAVOR}/${FILENAME_ICON}"
+	fi
+
+	INSTALLED_SIZE=$( du -ks "${INSTALL_DIR}/eclipse-${PACKAGE_FLAVOR}" | cut -f 1 )
+
+	cat <<EOF > "${DESTDIR}/usr/share/applications/eclipse-${PACKAGE_FLAVOR}.desktop"
+[Desktop Entry]
+Type=Application
+Name=${PACKAGE_DESCRIPTION}
+GenericName=${PACKAGE_DESCRIPTION}
+Exec=/opt/eclipse-${PACKAGE_FLAVOR}/eclipse
+Icon=/opt/eclipse-${PACKAGE_FLAVOR}/${FILENAME_ICON}
+Terminal=false
+Categories=Development;
+EOF
+
+	cat <<EOF > "${DESTDIR}/DEBIAN/control"
+Package: ${PACKAGE}
+Architecture: ${DEBIAN_ARCH}
+Version: ${PACKAGE_VERSION}
+Installed-Size: ${INSTALLED_SIZE}
+Maintainer: Korbinian Rosenegger https://github.com/kroseneg/make-debs
+Description: ${PACKAGE_DESCRIPTION}
+${PACKAGE_DESCRIPTION_LONG}
+EOF
+
+	echo "Building ${DEB_FILE}..."
+	dpkg-deb --build "${DESTDIR}" "${DEB_FILE}"
+	
+	return 0
+}
+
+
+list_all_flavours() {
+	wget -q -O - "${URL_BASE_DOWNLOAD}?F=0&P=*.xml" \
+	| grep href \
+	| sed 's|^.*href="\([^"]*\)".*|\1|' \
+	| while read xml; do
+		case "$xml" in
+			*.*.xml)
+				false
+				;;
+			*.xml)
+				basename "$xml" ".xml"
+				true
+				;;
+			*)
+				false
+				;;
+		esac
+	done \
+	| sort \
+	| uniq
+}
+
+
+list_all_archs() {
+	wget -q -O - "${URL_BASE_DOWNLOAD}?F=0&P=*.tar.gz" \
+	| grep href \
+	| sed 's|^.*href="\([^"]*\)".*|\1|' \
+	| while read targz; do
+		case "$targz" in
+			*.tar.gz)
+				echo "$targz" | sed 's/^.*-//; s/\..*$//'
+				;;
+		esac
+	done \
+	| sort \
+	| uniq \
+	| while read a; do
+		eclipse_arch_to_debian_arch "$a"
+	done
+}
+
+
+
+REQUESTED_ARCH="$1"
+REQUESTED_FLAVOUR="$2"
+
+ALL_ARCHS="$(list_all_archs)"
+ALL_FLAVOURS="$(list_all_flavours)"
+
+if [ "${REQUESTED_ARCH}" = "all" ]; then
+	BUILD_ARCHS="${ALL_ARCHS}"
+else
+	BUILD_ARCHS="$(echo "$ALL_ARCHS" | grep "^$REQUESTED_ARCH$")"
+fi
+
+if [ "${REQUESTED_FLAVOUR}" = "all" ]; then
+	BUILD_FLAVOURS="${ALL_FLAVOURS}"
+else
+	BUILD_FLAVOURS="$(echo "$ALL_FLAVOURS" | grep "^${REQUESTED_FLAVOUR}$")"
+fi
+
+
+if [ "${REQUESTED_FLAVOUR}" = "" -o "${REQUESTED_ARCH}" = "" -o "${BUILD_FLAVOURS}" = "" -o "${BUILD_ARCHS}" = "" ]; then
+	echo "Usage: $0 <arch> <flavour>"
+	echo " * Possible archs:"
+	echo "${ALL_ARCHS}" | sed 's/^/   - /'
+	echo " * Possible flavours:"
+	echo "${ALL_FLAVOURS}" | sed 's/^/   - /'
+	exit 1
+else
+
+	mkdir -p tmp/
+
+	while read A; do
+		REBUILD_PACKAGES=false
+		if [ ! -e "${DEBDIR}/${A}/" ]; then
+			mkdir -p "${DEBDIR}/${A}/"
+		fi
+		while read F; do
+			make_deb ${F} ${A}
+			if [ $? = 0 ]; then
+				REBUILD_PACKAGES=true
+			fi
+		done < <(echo "${BUILD_FLAVOURS}")
+
+		if $REBUILD_PACKAGES; then
+			echo "Generating Packages..."
+			PACKAGESDIR="$(readlink -f "${DEBDIR}/${A}")"
+			dpkg-scanpackages --multiversion "${PACKAGESDIR}" | sed 's|'$(dirname "${DEBDIR}")'/||' > "${PACKAGESDIR}/Packages"
+		fi
+
+	done < <(echo "${BUILD_ARCHS}")
+
+	echo "done."
+fi
